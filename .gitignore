@@ -1,4 +1,5 @@
 
 # Ignore dataset folders
 CKW_SMART_METER/
+Elec-tariffs.ie/
 __pycache__/

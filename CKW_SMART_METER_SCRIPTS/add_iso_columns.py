@@ -29,10 +29,10 @@ def add_temporal_columns(df: pd.DataFrame, timestamp_col: str = "timestamp") -> 
     if timestamp_col not in df.columns:
         raise ValueError(f"No se encontró la columna '{timestamp_col}'")
 
-    # Convertir a datetime; valores no válidos (ej. 'hour') se convierten en NaT
+    # Convertir a datetime; valores no válidos
     dt = pd.to_datetime(df[timestamp_col], errors="coerce")
 
-    # Saltar/filtrar filas con timestamp no válido
+    # Saltar filas con timestamp no válido
     valid_mask = dt.notna()
     if not valid_mask.all():
         df = df[valid_mask].copy()
@@ -57,18 +57,18 @@ def process_file(csv_path: Path, output_dir: Path | None = None, force: bool = F
         out_path = csv_path
 
     try:
-        # Comprobar cabecera rápidamente sin cargar todo el archivo en RAM
+        # Comprobar cabecera rápidamente sin cargar todo el archivo
         with open(csv_path, "r", encoding="utf-8", errors="ignore") as fp:
             header = fp.readline()
 
         if "timestamp" not in header:
             return False, "Omitido (sin columna 'timestamp')"
 
-        # Si ya contiene las columnas y no se fuerza el reprocesamiento, se salta
+        # Si ya contiene las columnas, se salta
         if "iso_year" in header and not force and output_dir is None:
             return True, "Ya procesado (omitido)"
 
-        # Procesamiento por bloques (chunks) para controlar el uso de RAM
+        # Procesamiento por bloques
         chunk_size = 250000
         tmp_out = out_path.with_suffix(out_path.suffix + ".tmp")
         first_chunk = True
