@@ -29,7 +29,7 @@ CHUNK_SIZE = 250_000
 """
 def add_temporal_columns(df: pd.DataFrame) -> pd.DataFrame:
     
-    # Los CSV mezclan 'dd/mm/YYYY', 'dd-mm-YYYY' y años de dos dígitos
+    # Los CSV mezclan 'dd/mm/YYYY', 'dd-mm-YYYY'
     dates = df[TIME_COL].str.replace("/", "-", regex=False)
     dt = pd.to_datetime(dates, format=TIME_FORMATS[0], errors="coerce")
     two_digit_year = dt.isna() & dates.notna()
