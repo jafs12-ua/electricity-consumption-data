@@ -12,12 +12,14 @@ Ejemplos:
     python3 order_by_user.py --limit-files 2 --output-dir /tmp/order_test
     python3 order_by_user.py --years 2021 2022
     python3 order_by_user.py --force
+    python3 order_by_user.py --user-id 768c2f018fbbe3910adb700128f8e506
 """
 
 import argparse
 import csv
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -26,6 +28,7 @@ from typing import Iterator
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,6 +74,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force", action="store_true",
         help="Rehacer ficheros de usuario existentes"
+    )
+    parser.add_argument(
+        "--user-id", default=None,
+        help="Regenerar solo el fichero de este id"
     )
     parser.add_argument(
         "--progress-every", type=int, default=1,
@@ -203,7 +210,9 @@ def process_day(path: Path, writers: UserWriters, chunk_rows: int) -> int:
     return rows_read
 
 
-def prepare_output(output_dir: Path, force: bool) -> tuple[Path, set[str]]:
+def prepare_output(
+    output_dir: Path, force: bool, regenerate_user: str | None = None,
+) -> tuple[Path, set[str]]:
     """Prepara la salida y devuelve el pid y los usuarios a omitir."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -215,9 +224,12 @@ def prepare_output(output_dir: Path, force: bool) -> tuple[Path, set[str]]:
     pid = os.getpid()
     # Los ficheros ya presentes se dan por terminados, salvo con --force.
     skip_users = set() if force else {p.stem for p in output_dir.glob("*.csv")}
-    if skip_users:
+    if regenerate_user:
+        skip_users.discard(regenerate_user)
+    if skip_users and not regenerate_user:
+        word = "fichero" if len(skip_users) == 1 else "ficheros"
         print(
-            f"Aviso: {len(skip_users):,} ficheros de usuario ya existen y se omitirán. "
+            f"Aviso: {len(skip_users):,} {word} de usuario ya existen y se omitirán. "
             "Usa --force para rehacerlos.",
             flush=True,
         )
@@ -246,6 +258,95 @@ def progress_line(
     )
 
 
+def read_user_rows(path: Path, user_id: str) -> list[str]:
+    """Filas de un usuario en un día, sin leer el CSV completo."""
+    parquet = path.with_suffix(".parquet")
+    if parquet.is_file():
+        table = pq.read_table(
+            parquet,
+            columns=["id", "timestamp", "value_kwh"],
+            filters=[("id", "=", user_id)],
+        )
+        df = table.to_pandas()
+        if df.empty:
+            return []
+        dt = pd.to_datetime(df["timestamp"])
+        iso = dt.dt.isocalendar()
+        df["weekday"] = iso["day"].astype(int)
+        df["iso_week"] = iso["week"].astype(int)
+        df["iso_year"] = iso["year"].astype(int)
+        df["hora"] = dt.dt.hour.astype(int)
+        df["minutos"] = dt.dt.minute.astype(int)
+        columns = [
+            "id", "timestamp", "value_kwh",
+            "weekday", "iso_week", "iso_year", "hora", "minutos",
+        ]
+        return df[columns].to_csv(
+            index=False, header=False, lineterminator="\n"
+        ).splitlines()
+
+    # Sin parquet: busca solo las líneas del id en el CSV.
+    prefix = f"{user_id},"
+    result = subprocess.run(
+        ["grep", "-F", prefix, str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    return [line for line in result.stdout.splitlines() if line.startswith(prefix)]
+
+
+def regenerate_user(
+    files: list[Path],
+    output_dir: Path,
+    user_id: str,
+    year_totals: Counter,
+    pid: int,
+    progress_every: int,
+) -> int:
+    """Rehace solo el fichero de un usuario a partir de los ficheros diarios."""
+    temp = output_dir / f".{user_id}.{pid}.tmp"
+    header = files[0].open(encoding="utf-8").readline().rstrip("\n")
+    year_progress = Counter()
+    rows = 0
+    started = time.monotonic()
+
+    try:
+        with open(temp, "w", newline="", encoding="utf-8") as fp:
+            for index, path in enumerate(files, 1):
+                lines = read_user_rows(path, user_id)
+                if lines:
+                    if not rows:
+                        fp.write(header + "\n")
+                    fp.write("".join(line + "\n" for line in lines))
+                    rows += len(lines)
+                year_progress[path.parent.name] += 1
+                if index % progress_every == 0 or index == len(files):
+                    detail = " | ".join(
+                        f"{name}: {year_progress[name]}/{count}"
+                        for name, count in year_totals.items()
+                    )
+                    print(
+                        f"[{index}/{len(files)}] {path.parent.name}/{path.name} | "
+                        f"{detail} | {rows:,} filas del usuario | "
+                        f"{time.monotonic() - started:.0f}s",
+                        flush=True,
+                    )
+
+        if not rows:
+            temp.unlink(missing_ok=True)
+            print(f"Error: el usuario {user_id} no aparece en los ficheros diarios.")
+            return 1
+        temp.replace(output_dir / f"{user_id}.csv")
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+    print(
+        f"\nFinalizado: {user_id}.csv en '{output_dir}', {rows:,} filas de "
+        f"{len(files)} ficheros diarios, {time.monotonic() - started:.0f}s."
+    )
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
@@ -257,6 +358,9 @@ def run(args: argparse.Namespace) -> int:
         return 1
     if args.progress_every < 1:
         print("Error: --progress-every debe ser mayor que 0.")
+        return 1
+    if args.user_id is not None and not SAFE_ID.fullmatch(args.user_id):
+        print(f"Error: el id '{args.user_id}' no es válido.")
         return 1
 
     files = find_day_files(input_dir, args.years)
@@ -281,7 +385,12 @@ def run(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    pid, skip_users = prepare_output(output_dir, args.force)
+    pid, skip_users = prepare_output(output_dir, args.force, args.user_id)
+    if args.user_id:
+        print(f"Regenerando solo el usuario {args.user_id}.", flush=True)
+        return regenerate_user(
+            files, output_dir, args.user_id, year_totals, pid, args.progress_every
+        )
     writers = UserWriters(output_dir, pid, skip_users)
     total_rows = 0
     started = time.monotonic()
