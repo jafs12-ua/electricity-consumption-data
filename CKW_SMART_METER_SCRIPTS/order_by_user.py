@@ -1,5 +1,5 @@
 """
-Agrupa los ficheros diarios de CKW_SMART_METER en un CSV por usuario.
+Agrupa los ficheros diarios (carpeta configurable) en un CSV por usuario.
 
 Genera ordered_files/<id>.csv con todas las filas de cada id.
 Los días se procesan en orden y los ids ya vienen agrupados, así que
@@ -8,9 +8,9 @@ cada fichero queda cronológico sin necesidad de ordenar.
 Uso:
     python3 order_by_user.py [opciones]
 
-Ejemplos:
-    python3 order_by_user.py --limit-files 2 --output-dir /tmp/order_test
-    python3 order_by_user.py --years 2021 2022
+Ejemplos (sitúate en la carpeta que contiene los días, o pasa --input-dir):
+    python3 order_by_user.py --limit-files 2
+    python3 order_by_user.py --input-dir datos --output-dir datos/ordenados --years 2021 2022
     python3 order_by_user.py --force
     python3 order_by_user.py --user-id 768c2f018fbbe3910adb700128f8e506
 """
@@ -22,7 +22,7 @@ import re
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Iterator
 
@@ -31,10 +31,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT_DIR = SCRIPT_DIR.parent / "CKW_SMART_METER"
-DEFAULT_OUTPUT_DIR = DEFAULT_INPUT_DIR / "ordered_files"
-EXCLUDED_DIRS = {"ordered_files", "summary", "__pycache__"}
+# Sin nombres de carpeta fijos: --input-dir decide dónde están los días.
+DEFAULT_INPUT_DIR = Path(".")
+EXCLUDED_DIRS = {"ordered_files", "locf_files", "fixed_timestamps", "summary", "__pycache__"}
 SAFE_ID = re.compile(r"[A-Za-z0-9_.-]+")
 STALE_TMP = re.compile(r"\.[A-Za-z0-9_.-]+\.\d+\.tmp")
 
@@ -53,11 +52,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--input-dir", default=str(DEFAULT_INPUT_DIR),
-        help=f"Carpeta de entrada. Por defecto {DEFAULT_INPUT_DIR}"
+        help="Carpeta que contiene los días. Por defecto la carpeta actual (.)"
     )
     parser.add_argument(
-        "--output-dir", default=str(DEFAULT_OUTPUT_DIR),
-        help=f"Carpeta de salida. Por defecto {DEFAULT_OUTPUT_DIR}"
+        "--output-dir", default=None,
+        help="Carpeta de salida. Por defecto <input-dir>/ordered_files"
     )
     parser.add_argument(
         "--years", nargs="*", default=None,
@@ -66,6 +65,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--chunk-rows", type=int, default=500_000,
         help="Filas por bloque. Por defecto 500000"
+    )
+    parser.add_argument(
+        "--max-open", type=int, default=128,
+        help="Máximo de ficheros de usuario abiertos a la vez. Por defecto 128"
     )
     parser.add_argument(
         "--limit-files", type=int, default=None,
@@ -86,25 +89,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def find_day_files(input_dir: Path, years: list[str] | None) -> list[Path]:
-    """Devuelve los ficheros diarios ordenados por año y día."""
-    if years:
-        directories = [input_dir / name for name in years]
-    else:
-        directories = [
-            path for path in input_dir.iterdir()
-            if path.is_dir() and path.name not in EXCLUDED_DIRS
-        ]
+def find_day_files(
+    input_dir: Path, years: list[str] | None, output_dir: Path | None = None,
+) -> list[Path]:
+    """Busca CSV de día (nombre numérico) bajo input_dir, sin importar el nombre de las carpetas."""
+    output_resolved = output_dir.resolve() if output_dir is not None else None
 
-    files: list[Path] = []
-    for directory in directories:
-        if not directory.is_dir():
-            print(f"Aviso: el directorio '{directory}' no existe, se omite.")
-            continue
-        files.extend(
-            path for path in directory.glob("*.csv")
-            if path.stem.isdigit() and path.is_file()
-        )
+    def usable(path: Path) -> bool:
+        if not path.is_file() or not path.stem.isdigit():
+            return False
+        if any(part in EXCLUDED_DIRS for part in path.parts):
+            return False
+        return output_resolved is None or output_resolved not in path.resolve().parents
+
+    files = [path for path in input_dir.rglob("*.csv") if usable(path)]
+
+    if years:
+        files = [
+            path for path in files
+            if any(year == path.parent.name or year in path.parent.name for year in years)
+        ]
 
     return sorted(files, key=natural_sort_key)
 
@@ -124,21 +128,36 @@ def consecutive_user_groups(chunk: pd.DataFrame) -> Iterator[tuple[str, np.ndarr
 
 
 class UserWriters:
-    """Temporales de usuario abiertos durante toda la ejecución."""
+    """Temporales de usuario con un número limitado de descriptores abiertos."""
 
-    def __init__(self, output_dir: Path, pid: int, skip_users: set[str]):
+    def __init__(
+        self, output_dir: Path, pid: int, skip_users: set[str], max_open: int = 128,
+    ):
         self.output_dir = output_dir
         self.pid = pid
         self.skip_users = skip_users
         self.header: list[str] | None = None
-        self.handles: dict[str, object] = {}
+        # LRU: si se supera max_open se cierra el menos usado y se reabre después.
+        self.handles: OrderedDict[str, object] = OrderedDict()
         self.csv_writers: dict[str, csv.writer] = {}
         self.written_users: set[str] = set()
         self.skipped_users: set[str] = set()
         self.invalid_users: set[str] = set()
+        self.max_open = max(1, max_open)
 
     def _temp_path(self, user_id: str) -> Path:
         return self.output_dir / f".{user_id}.{self.pid}.tmp"
+
+    def _open(self, user_id: str):
+        path = self._temp_path(user_id)
+        if user_id in self.written_users:
+            fp = open(path, "a", newline="", encoding="utf-8")
+        else:
+            fp = open(path, "w", newline="", encoding="utf-8")
+            fp.write(",".join(self.header) + "\n")
+            self.written_users.add(user_id)
+        self.handles[user_id] = fp
+        return fp
 
     def write_group(self, user_id: str, rows: np.ndarray) -> None:
         if not SAFE_ID.fullmatch(user_id):
@@ -150,10 +169,13 @@ class UserWriters:
 
         fp = self.handles.get(user_id)
         if fp is None:
-            # Un fichero abierto por usuario, en vez de uno por día.
-            fp = open(self._temp_path(user_id), "w", newline="", encoding="utf-8")
-            self.handles[user_id] = fp
-            fp.write(",".join(self.header) + "\n")
+            if len(self.handles) >= self.max_open:
+                evicted, old_fp = self.handles.popitem(last=False)
+                old_fp.close()
+                self.csv_writers.pop(evicted, None)
+            fp = self._open(user_id)
+        else:
+            self.handles.move_to_end(user_id)
 
         separators = len(self.header) - 1
         for row in rows:
@@ -171,11 +193,12 @@ class UserWriters:
                     writer = csv.writer(fp, lineterminator="\n")
                     self.csv_writers[user_id] = writer
                 writer.writerow(row)
-        self.written_users.add(user_id)
 
     def close_handles(self) -> None:
         for fp in self.handles.values():
             fp.close()
+        self.handles.clear()
+        self.csv_writers.clear()
 
     def commit(self) -> None:
         """Cierra y renombra los temporales al terminar."""
@@ -348,13 +371,19 @@ def regenerate_user(
 
 
 def run(args: argparse.Namespace) -> int:
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
+    input_dir = Path(args.input_dir).expanduser()
+    output_dir = (
+        Path(args.output_dir).expanduser()
+        if args.output_dir else input_dir / "ordered_files"
+    )
     if not input_dir.is_dir():
         print(f"Error: la carpeta de entrada '{input_dir}' no existe.")
         return 1
     if args.chunk_rows < 1:
         print("Error: --chunk-rows debe ser mayor que 0.")
+        return 1
+    if args.max_open < 1:
+        print("Error: --max-open debe ser mayor que 0.")
         return 1
     if args.progress_every < 1:
         print("Error: --progress-every debe ser mayor que 0.")
@@ -363,7 +392,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"Error: el id '{args.user_id}' no es válido.")
         return 1
 
-    files = find_day_files(input_dir, args.years)
+    files = find_day_files(input_dir, args.years, output_dir)
     if not files:
         print(f"No se encontraron ficheros .csv diarios en '{input_dir}'.")
         return 1
@@ -391,7 +420,7 @@ def run(args: argparse.Namespace) -> int:
         return regenerate_user(
             files, output_dir, args.user_id, year_totals, pid, args.progress_every
         )
-    writers = UserWriters(output_dir, pid, skip_users)
+    writers = UserWriters(output_dir, pid, skip_users, max_open=args.max_open)
     total_rows = 0
     started = time.monotonic()
 

@@ -1,29 +1,28 @@
 """
-Rellena 'value_kwh' con LAST OBSERVATION CARRIED FORWARD (LOCF) usando 'timestamp'.
+Rellena 'value_kwh' usando 'timestamp'.
 
-En que se basa el metodo:
-    LOCF es un metodo de imputacion de series temporales en el que cada valor
-    ausente se sustituye por la ultima observacion real anterior en el tiempo
-    (R imputeTS::na_locf, DescTools::LOCF, pypots imputation/locf).
-    Cuando el hueco esta al principio de la serie no hay observacion anterior:
-    se aplica NOCB (Next Observation Carried Backward), es decir, el primer
-    valor real se lleva hacia atras. Asi se rellena tambien el principio.
+Metodo: para cada hueco se toma la observacion real mas cercana anterior y la
+mas cercana posterior, y se escribe su media. Si la vecina inmediata no tiene
+valor se sigue buscando hacia atras/hacia delante la siguiente observacion real
+(el "segundo anterior", etc.). Si solo existe un lado, se usa ese unico valor;
+si no existe ninguno, se deja vacio. Los huecos consecutivos entre dos valores
+reales reciben la misma media.
 
-    El orden se deduce de 'timestamp' con orden estable (mergesort), por lo que
-    las filas con el mismo timestamp conservan su orden original del CSV. Si
-    existe la columna 'id', se aplica por usuario para no mezclar series. Las
-    filas con timestamp no válido se dejan intactas y se cuentan al final.
+El orden se deduce de 'timestamp' con orden estable (mergesort), por lo que
+las filas con el mismo timestamp conservan su orden original del CSV. Si
+existe la columna 'id', se aplica por usuario para no mezclar series. Las
+filas con timestamp no válido se dejan intactas y se cuentan al final.
 
-    Se añade la columna 'inputed':
-        0 = el valor ya estaba escrito (real)
-        1 = el valor se ha puesto con LOCF/NOCB
+Se añade la columna 'imp' (de imputation):
+    0 = el valor ya estaba escrito (real)
+    1 = el valor se ha imputado (o ya venía marcado por otra imputación)
 
 Uso:
     python3 apply_locf.py [ruta_archivo_o_directorio] [opciones]
 
 Ejemplos:
     python3 apply_locf.py --limit-files 2 -o /tmp/locf_test
-    python3 apply_locf.py CKW_SMART_METER/ordered_files -w 8
+    python3 apply_locf.py ordered_files -w 8
     python3 apply_locf.py un_archivo.csv -o /tmp/salida --force
 
 Nota: --force sobre un CSV ya imputado no recupera los huecos originales;
@@ -43,13 +42,26 @@ import pandas as pd
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT_DIR = SCRIPT_DIR.parent / "CKW_SMART_METER" / "ordered_files"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR.parent / "CKW_SMART_METER" / "locf_files"
+DEFAULT_INPUT_DIR = Path("ordered_files")
+DEFAULT_OUTPUT_DIR = Path("locf_files")
 
 TIMESTAMP_COL = "timestamp"
 VALUE_COL = "value_kwh"
 ID_COL = "id"
-FLAG_COL = "inputed"
+FLAG_COL = "imp"
+
+
+def to_float(value: object) -> float:
+    """Convierte a float; devuelve nan si el texto no es un número."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def format_imputed(value: float) -> str:
+    """Escribe la media sin ceros sobrantes ni artefactos de coma flotante."""
+    return format(value, ".12g")
 
 
 def natural_sort_key(path: Path) -> list[int | str]:
@@ -62,7 +74,7 @@ def natural_sort_key(path: Path) -> list[int | str]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Rellena value_kwh con LOCF y añade la columna inputed"
+        description="Rellena value_kwh con la media de los vecinos y añade la columna imp"
     )
     parser.add_argument(
         "path",
@@ -97,7 +109,9 @@ def group_positions(df: pd.DataFrame) -> list[np.ndarray]:
     return [np.asarray(positions) for positions in df.groupby(ID_COL, sort=False, dropna=False).indices.values()]
 
 
-def apply_locf(df: pd.DataFrame) -> tuple[pd.DataFrame, int, int, int]:
+def apply_locf(
+    df: pd.DataFrame, previous_flags: np.ndarray | None = None
+) -> tuple[pd.DataFrame, int, int, int]:
     """Devuelve DataFrame, imputadas, sin imputar y timestamps no válidos."""
     required = {TIMESTAMP_COL, VALUE_COL}
     missing_cols = required - set(df.columns)
@@ -108,8 +122,9 @@ def apply_locf(df: pd.DataFrame) -> tuple[pd.DataFrame, int, int, int]:
     valid_timestamps = timestamps.notna().to_numpy()
     invalid = int((~valid_timestamps).sum())
 
-    # Los valores se rellenan como texto: no hay que convertir a float ni
-    # reformatear los números al volver a escribir el CSV.
+    # Los valores reales se conservan como texto: no hay que reformatearlos al
+    # volver a escribir el CSV. Solo se convierten a float los vecinos que se
+    # usan para calcular una media.
     values = df[VALUE_COL].to_numpy(dtype=object).copy()
     values[pd.isna(values)] = ""
     imputed_mask = np.zeros(len(df), dtype=bool)
@@ -131,16 +146,43 @@ def apply_locf(df: pd.DataFrame) -> tuple[pd.DataFrame, int, int, int]:
             unfilled += positions.size
             continue
 
-        # ffill con accumulate, y los huecos iniciales con el primer valor.
-        index = np.where(has_value, np.arange(series.size), 0)
-        np.maximum.accumulate(index, out=index)
-        filled = series[index]
-        first = int(np.flatnonzero(has_value)[0])
-        if first:
-            filled[:first] = series[first]
+        # Vecinos reales más cercanos a cada hueco (hacia atrás y adelante):
+        # si el inmediato está vacío se sigue con el siguiente real.
+        real = np.flatnonzero(has_value)
+        missing = np.flatnonzero(~has_value)
+        numbers = np.fromiter(
+            (to_float(v) for v in series), dtype=float, count=series.size
+        )
+        before = np.searchsorted(real, missing, side="left") - 1
+        after = np.searchsorted(real, missing, side="right")
+        left = np.where(before >= 0, numbers[real[np.maximum(before, 0)]], np.nan)
+        right = np.where(
+            after < real.size, numbers[real[np.minimum(after, real.size - 1)]], np.nan
+        )
 
-        values[positions] = filled
-        imputed_mask[positions] = ~has_value
+        estimate = np.full(missing.size, np.nan, dtype=float)
+        both = np.isfinite(left) & np.isfinite(right)
+        only_left = np.isfinite(left) & ~np.isfinite(right)
+        only_right = ~np.isfinite(left) & np.isfinite(right)
+        estimate[both] = (left[both] + right[both]) / 2.0
+        estimate[only_left] = left[only_left]
+        estimate[only_right] = right[only_right]
+
+        filled_text = np.array(
+            [format_imputed(x) if np.isfinite(x) else "" for x in estimate],
+            dtype=object,
+        )
+        has_estimate = filled_text != ""
+        series[missing] = filled_text
+        imputed_mask[positions[missing]] = has_estimate
+        unfilled += int((~has_estimate).sum())
+
+        values[positions] = series
+
+    # Conserva las marcas de imputaciones anteriores (p. ej. timestamps ya
+    # reparados por fix_timestamps.py).
+    if previous_flags is not None:
+        imputed_mask |= previous_flags
 
     # df no se reutiliza fuera de aquí: se modifica en sitio.
     result = df
@@ -174,7 +216,7 @@ def process_file(
     output_dir: Path,
     force: bool,
 ) -> tuple[bool, str, int, int, int]:
-    """Lee un CSV, aplica LOCF y lo escribe en output_dir."""
+    """Lee un CSV, imputa los huecos y lo escribe en output_dir."""
     if output_dir:
         relative = csv_path.relative_to(input_root) if input_root.is_dir() else csv_path.name
         out_path = output_dir / relative
@@ -189,12 +231,14 @@ def process_file(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
 
+        previous_flags = None
         if FLAG_COL in df.columns:
-            if not force:
-                return True, "Ya tiene 'inputed' (omitido)", 0, 0, 0
+            previous_flags = (
+                pd.to_numeric(df[FLAG_COL], errors="coerce").fillna(0).to_numpy() != 0
+            )
             df = df.drop(columns=[FLAG_COL])
 
-        filled, imputed, unfilled, invalid = apply_locf(df)
+        filled, imputed, unfilled, invalid = apply_locf(df, previous_flags)
         write_csv(filled, temp_path)
         temp_path.replace(out_path)
 

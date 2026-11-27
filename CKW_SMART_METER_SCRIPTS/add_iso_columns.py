@@ -8,6 +8,11 @@ Columnas añadidas:
   - hora: Hora del día (0 a 23)
   - minutos: Minuto de la hora (0 a 59)
 
+Nota: los timestamps del dataset están en hora local de Suiza (Europe/Zurich,
+sin sufijo UTC), por lo que 'hora' se obtiene directamente, sin convertir zonas.
+El cambio de horario se aprecia en los propios datos: el 2021-03-28 faltan las
+franjas 02:00-02:45 y el 2021-10-31 están repetidas.
+
 Uso:
     python3 add_iso_columns.py [ruta_archivo_o_directorio] [opciones]
 """
