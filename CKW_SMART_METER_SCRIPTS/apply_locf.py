@@ -84,8 +84,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-o", "--output-dir",
-        default=str(DEFAULT_OUTPUT_DIR),
-        help=f"Directorio de destino. Por defecto {DEFAULT_OUTPUT_DIR}",
+        default=None,
+        help=(
+            "Directorio de destino. Por defecto crea 'locf_files' al mismo nivel "
+            "que el CSV o directorio de entrada"
+        ),
     )
     parser.add_argument(
         "-w", "--workers", type=int, default=8,
@@ -272,22 +275,26 @@ def main() -> int:
         print("Error: --limit-files debe ser mayor que 0.")
         return 1
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     if target.is_file():
         files = [target]
         input_root = target.parent
+        default_output_dir = target.parent / DEFAULT_OUTPUT_DIR
     else:
         input_root = target
+        default_output_dir = target.parent / DEFAULT_OUTPUT_DIR
         files = sorted(
             (
                 path for path in target.rglob("*.csv")
                 if not path.name.endswith((".tmp", ".bak"))
-                and output_dir not in path.parents
             ),
             key=natural_sort_key,
         )
+
+    output_dir = Path(args.output_dir) if args.output_dir else default_output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if target.is_dir():
+        files = [path for path in files if output_dir not in path.parents]
 
     if args.limit_files is not None:
         files = files[: args.limit_files]
